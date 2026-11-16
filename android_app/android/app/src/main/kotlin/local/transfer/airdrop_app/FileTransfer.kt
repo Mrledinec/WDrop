@@ -68,7 +68,8 @@ internal object FileTransfer {
             }
         } ?: throw IOException("Не удалось открыть файл")
         val api = PeerApi(peer, store.network)
-        val payload = JSONObject().put("name", name).put("size", size).put("sha256", digest.digest().hex())
+        val hash = digest.digest().hex()
+        val payload = JSONObject().put("name", name).put("size", size).put("sha256", hash)
         var offer = Offer.fromJson(api.objectRequest("/offers", payload))
         val id = offer.id
         val deadline = SystemClock.elapsedRealtime() + 65_000
@@ -104,7 +105,7 @@ internal object FileTransfer {
             }
             api.check(connection)
         }
-        store.record(id, name, "sent", size, uri.toString(), grantFlags = grantFlags)
+        store.record(id, name, "sent", size, uri.toString(), grantFlags = grantFlags, hash = hash)
         sendProgress = null
         sendStatus = "Отправлено: $name"
     }

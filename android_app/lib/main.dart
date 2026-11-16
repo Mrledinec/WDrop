@@ -9,7 +9,7 @@ class LocalTransferApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'Обмен файлами',
+    title: 'WDrop',
     debugShowCheckedModeBanner: false,
     theme: ThemeData(colorSchemeSeed: const Color(0xff2458a5)),
     darkTheme: ThemeData(

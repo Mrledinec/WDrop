@@ -10,7 +10,8 @@ from tempfile import NamedTemporaryFile
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-VERSION = "0.1.6"
+APP_NAME = "WDrop"
+VERSION = "0.1.7"
 REPOSITORY = "Mrledinec/WDrop"
 MAX_INSTALLER_SIZE = 512 * 1024 * 1024
 
@@ -28,7 +29,7 @@ def check_release():
     url = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
     request = Request(url, headers={
         "Accept": "application/vnd.github+json",
-        "User-Agent": f"LocalTransfer/{VERSION}",
+        "User-Agent": f"{APP_NAME}/{VERSION}",
     })
     try:
         with urlopen(request, timeout=12) as response:
@@ -71,7 +72,7 @@ def download_installer(release, destination: Path):
     received = 0
     temporary = None
     try:
-        request = Request(release.url, headers={"User-Agent": f"LocalTransfer/{VERSION}"})
+        request = Request(release.url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
         with urlopen(request, timeout=30) as response, NamedTemporaryFile(
             dir=destination, prefix="installer-", suffix=".part", delete=False,
         ) as file:

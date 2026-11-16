@@ -95,20 +95,14 @@ internal class TransferStore(context: Context) {
     @Synchronized
     fun record(
         id: String, name: String, direction: String, size: Long, uri: String = "",
-        receipt: String? = null, grantFlags: Int = 0,
+        receipt: String? = null, grantFlags: Int = 0, hash: String = "",
     ) {
         val history = history()
         if (history.any { it["id"] == id }) return
-        if (grantFlags != 0 && direction == "sent") {
-            try {
-                resolver.takePersistableUriPermission(Uri.parse(uri), grantFlags)
-            } catch (_: SecurityException) {
-                // Some shares grant access only while their activity is active.
-            }
-        }
+        if (direction == "sent") keepGrant(Uri.parse(uri), grantFlags)
         val newItem = mapOf(
             "id" to id, "name" to name, "direction" to direction, "size" to size,
-            "uri" to uri, "time" to System.currentTimeMillis(),
+            "uri" to uri, "time" to System.currentTimeMillis(), "sha256" to hash,
         )
         val items = listOf(newItem) + history
         val kept = items.take(20)
@@ -118,6 +112,26 @@ internal class TransferStore(context: Context) {
             editor.putString("receipts", receipts.toString())
         }
         if (editor.commit()) releaseUnusedGrants(items, kept)
+    }
+
+    @Synchronized
+    fun linkSentFile(id: String, uri: Uri, grantFlags: Int, hash: String) {
+        val entries = history()
+        require(entries.any { it["id"] == id && it["direction"] == "sent" }) { "Запись о файле недоступна." }
+        keepGrant(uri, grantFlags)
+        val linked = entries.map {
+            if (it["id"] == id) it + mapOf("uri" to uri.toString(), "sha256" to hash) else it
+        }
+        if (historyEditor(linked, entries).commit()) releaseUnusedGrants(entries, linked)
+    }
+
+    private fun keepGrant(uri: Uri, flags: Int) {
+        if (flags == 0) return
+        try {
+            resolver.takePersistableUriPermission(uri, flags)
+        } catch (_: SecurityException) {
+            // Some shares grant access only while their activity is active.
+        }
     }
 
     @Synchronized

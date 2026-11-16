@@ -1,4 +1,4 @@
-﻿#define AppName "Обмен файлами"
+﻿#define AppName "WDrop"
 #define AppExe "LocalTransfer.exe"
 
 [Setup]

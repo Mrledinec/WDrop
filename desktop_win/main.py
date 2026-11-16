@@ -33,7 +33,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from desktop_win.server.server_api import TransferService, local_ipv4, make_api
-from desktop_win.update import VERSION, check_release, download_installer
+from desktop_win.update import APP_NAME, VERSION, check_release, download_installer
 
 
 STATE_LABELS = {
@@ -83,7 +83,7 @@ class Window(QMainWindow):
         self.exiting = False
         self.tray = None
 
-        self.setWindowTitle("Обмен файлами")
+        self.setWindowTitle(APP_NAME)
         settings_menu = self.menuBar().addMenu("Настройки")
         settings_menu.addAction("Папка для полученных файлов…", self.choose_inbox)
         settings_menu.addAction("Очистить историю передач…", self.clear_history)
@@ -802,7 +802,7 @@ def run_app(args, windowed):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Обмен файлами по локальной сети")
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} — обмен файлами по локальной сети")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--bind", default="0.0.0.0", help="IPv4-интерфейс для локального сервера")
     parser.add_argument("--address", help="IPv4-адрес ПК, который будет указан в QR")
@@ -810,6 +810,7 @@ def main():
     parser.add_argument("--inbox", type=Path)
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
+    app.setApplicationName(APP_NAME)
     windowed = sys.stdout is None or sys.stderr is None
     try:
         return run_app(args, windowed)
@@ -817,7 +818,7 @@ def main():
         if not windowed:
             raise
         logging.exception("Application startup failed")
-        QMessageBox.critical(None, "Не удалось запустить «Обмен файлами»", str(error))
+        QMessageBox.critical(None, f"Не удалось запустить {APP_NAME}", str(error))
         return 1
 
 

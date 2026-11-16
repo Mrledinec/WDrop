@@ -21,6 +21,7 @@ import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.security.MessageDigest
 import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ScheduledFuture
@@ -35,10 +36,13 @@ internal fun transferStore(context: Context): TransferStore {
 }
 
 class MainActivity : FlutterActivity() {
+    private data class HistorySelection(val id: String, val location: Boolean, val result: MethodChannel.Result)
+
     private val store by lazy { transferStore(this) }
     private val update by lazy { AppUpdate(applicationContext) }
     private val executor = Executors.newCachedThreadPool()
     private var picking: Pair<Peer, MethodChannel.Result>? = null
+    private var historySelection: HistorySelection? = null
     private var sharedFiles = emptyList<Uri>()
     private var sharedGrantFlags = 0
     private val discoveries = ConcurrentHashMap<String, LanDevice>()
@@ -250,26 +254,8 @@ class MainActivity : FlutterActivity() {
                             result.success(null)
                         }
                         "historyFileInfo" -> result.success(historyFileInfo(id))
-                        "historyFileLocation" -> {
-                            openHistoryFolder(id)
-                            result.success(null)
-                        }
-                        "open" -> {
-                            val uri = Uri.parse(call.argument<String>("uri").orEmpty())
-                            require(uri.scheme == "content")
-                            val filename = call.argument<String>("name").orEmpty()
-                            val mime = mimeForName(filename) ?: contentResolver.getType(uri)
-                                ?: "application/octet-stream"
-                            contentResolver.openFileDescriptor(uri, "r")?.close()
-                                ?: throw IllegalArgumentException("Файл недоступен")
-                            val intent = Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime)
-                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            require(intent.resolveActivity(packageManager) != null) {
-                                "Для этого типа файла нет приложения."
-                            }
-                            startActivity(Intent.createChooser(intent, "Открыть файл"))
-                            result.success(null)
-                        }
+                        "historyFileLocation", "openHistoryFile" ->
+                            historyAction(HistorySelection(id, call.method == "historyFileLocation", result))
                         else -> result.notImplemented()
                     }
                 } catch (error: Exception) {
@@ -328,27 +314,140 @@ class MainActivity : FlutterActivity() {
         store.forgetHistory(id)
     }
 
-    private fun openHistoryFolder(id: String) {
-        val item = historyItem(id)
-        val uri = requireNotNull(historyUri(item)) { "Ссылка на исходный файл не сохранилась." }
-        val initial = if (DocumentsContract.isDocumentUri(this, uri)) {
-            uri
-        } else {
-            val path = historyFileInfo(id)["folder"] as? String
-            requireNotNull(path) { "Источник не предоставил расположение файла." }
-            DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:$path")
+    private fun historyAction(selection: HistorySelection) {
+        val item = historyItem(selection.id)
+        val received = item["direction"] == "received"
+        executor.execute {
+            val target = runCatching {
+                historyUri(item)?.let { uri ->
+                    val available = runCatching {
+                        contentResolver.openFileDescriptor(uri, "r")?.use { true } ?: false
+                    }.getOrDefault(false)
+                    when {
+                        selection.location && (received || available) -> historyFolder(selection.id, uri)
+                        available -> uri
+                        else -> null
+                    }
+                }
+            }
+            runOnUiThread {
+                try {
+                    val uri = target.getOrThrow()
+                    if (uri == null && !received) {
+                        selectHistoryFile(selection)
+                    } else {
+                        requireNotNull(uri) { "Файл недоступен." }
+                        launchHistoryAction(selection, item, uri)
+                        selection.result.success(null)
+                    }
+                } catch (error: Exception) {
+                    fail(selection.result, error)
+                }
+            }
+        }
+    }
+
+    private fun historyFolder(id: String, uri: Uri): Uri? {
+        if (DocumentsContract.isDocumentUri(this, uri)) {
+            if (uri.authority == "com.android.externalstorage.documents") {
+                val document = DocumentsContract.getDocumentId(uri)
+                val volume = document.substringBefore(':')
+                val folder = document.substringAfter(':').substringBeforeLast('/', "")
+                return DocumentsContract.buildDocumentUri(uri.authority, "$volume:$folder")
+            }
+            return uri
+        }
+        val path = historyFileInfo(id)["folder"] as? String ?: return null
+        return DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:$path")
+    }
+
+    private fun launchHistoryAction(selection: HistorySelection, item: Map<String, Any>, target: Uri) {
+        if (!selection.location) {
+            val mime = contentResolver.getType(target) ?: mimeForName(item["name"].toString())
+                ?: "application/octet-stream"
+            val intent = Intent(Intent.ACTION_VIEW).setDataAndType(target, mime)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            require(intent.resolveActivity(packageManager) != null) { "Для этого типа файла нет приложения." }
+            startActivity(Intent.createChooser(intent, "Открыть файл"))
+            return
         }
         try {
             startActivity(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
                 type = "*/*"
-                putExtra(DocumentsContract.EXTRA_INITIAL_URI, initial)
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, target)
             })
         } catch (_: ActivityNotFoundException) {
             if (item["direction"] == "received") {
                 startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
             } else {
                 throw IllegalArgumentException("Системное приложение «Файлы» недоступно.")
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun selectHistoryFile(selection: HistorySelection) {
+        require(historySelection == null && picking == null) { "Сначала закройте выбор файла." }
+        historySelection = selection
+        try {
+            startActivityForResult(
+                Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"),
+                PICK_HISTORY_FILE,
+            )
+        } catch (error: Exception) {
+            historySelection = null
+            throw error
+        }
+    }
+
+    private fun finishHistorySelection(resultCode: Int, data: Intent?) {
+        val selection = historySelection ?: return
+        historySelection = null
+        val uri = data?.data
+        if (resultCode != Activity.RESULT_OK || uri == null) {
+            selection.result.success(null)
+            return
+        }
+        executor.execute {
+            val target = runCatching {
+                val item = historyItem(selection.id)
+                val expectedHash = item["sha256"] as? String ?: ""
+                if (expectedHash.isEmpty()) {
+                    val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                        ?.use { if (it.moveToFirst()) it.getString(0) else null }
+                    require(name?.take(255) == item["name"]) { "Выберите исходный файл «${item["name"]}»." }
+                }
+                val expectedSize = (item["size"] as Number).toLong()
+                var size = 0L
+                val digest = MessageDigest.getInstance("SHA-256")
+                requireNotNull(contentResolver.openInputStream(uri)) { "Не удалось открыть выбранный файл." }.use { input ->
+                    val buffer = ByteArray(256 * 1024)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        size += count
+                        require(size <= expectedSize) { "Размер файла отличается от записи в истории." }
+                        digest.update(buffer, 0, count)
+                    }
+                }
+                val hash = digest.digest().hex()
+                require(size == expectedSize) { "Размер файла отличается от записи в истории." }
+                require(expectedHash.isEmpty() || expectedHash == hash) { "Выбранный файл отличается от отправленного." }
+                store.linkSentFile(selection.id, uri, persistableFlags(data.flags), hash)
+                val destination = if (selection.location) {
+                    requireNotNull(historyFolder(selection.id, uri)) { "Источник не предоставил расположение файла." }
+                } else uri
+                item to destination
+            }
+            runOnUiThread {
+                try {
+                    val (item, destination) = target.getOrThrow()
+                    launchHistoryAction(selection, item, destination)
+                    selection.result.success(null)
+                } catch (error: Exception) {
+                    fail(selection.result, error)
+                }
             }
         }
     }
@@ -401,7 +500,7 @@ class MainActivity : FlutterActivity() {
 
     @Suppress("DEPRECATION")
     private fun pickFile(id: String, result: MethodChannel.Result) {
-        require(!FileTransfer.sending && picking == null) { "Уже выполняется отправка" }
+        require(!FileTransfer.sending && picking == null && historySelection == null) { "Завершите выбор файла или отправку." }
         val peer = store.peers().find { it.pin == id } ?: throw IllegalArgumentException("ПК удалён")
         val picker = Intent(Intent.ACTION_OPEN_DOCUMENT)
             .addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
@@ -417,6 +516,10 @@ class MainActivity : FlutterActivity() {
     @Deprecated("Android result is used by the Flutter host activity")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == PICK_HISTORY_FILE) {
+            finishHistorySelection(resultCode, data)
+            return
+        }
         if (requestCode != PICK_FILE) return
         val (peer, result) = picking ?: return
         picking = null
@@ -450,6 +553,7 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val PICK_FILE = 401
+        private const val PICK_HISTORY_FILE = 402
     }
 }
 

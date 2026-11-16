@@ -7,7 +7,7 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 }
 
 $desktop = [Environment]::GetFolderPath('DesktopDirectory')
-$path = Join-Path $desktop 'Обмен файлами.lnk'
+$path = Join-Path $desktop 'WDrop (разработка).lnk'
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($path)
 if ((Test-Path -LiteralPath $path) -and $shortcut.TargetPath -ne $python) {
@@ -16,7 +16,7 @@ if ((Test-Path -LiteralPath $path) -and $shortcut.TargetPath -ne $python) {
 $shortcut.TargetPath = $python
 $shortcut.Arguments = '-m desktop_win.main'
 $shortcut.WorkingDirectory = $project
-$shortcut.Description = 'Обмен файлами между Windows и Android'
+$shortcut.Description = 'WDrop — обмен файлами между Windows и Android'
 $shortcut.Save()
 if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
     throw 'The shortcut could not be saved.'

@@ -286,15 +286,16 @@ class _HomeScreenState extends State<HomeScreen> {
     final received = item['direction'] == 'received';
     final uri = item['uri'] as String? ?? '';
     final name = item['name'].toString();
+    final options = {'id': item['id'] as String};
     return ListTile(
       leading: Icon(received ? Icons.download_outlined : Icons.upload_outlined),
       title: Text(name, maxLines: 2, overflow: TextOverflow.ellipsis),
       subtitle: Text(
         '${received ? 'Получено' : 'Отправлено'} · ${_size(item['size'])}',
       ),
-      onTap: uri.isEmpty
+      onTap: received && uri.isEmpty
           ? () => _historyMenu(item)
-          : () => _run('open', {'uri': uri, 'name': name}),
+          : () => _run('openHistoryFile', options),
       onLongPress: () => _historyMenu(item),
       trailing: IconButton(
         tooltip: 'Действия с файлом',
@@ -349,7 +350,7 @@ class _HomeScreenState extends State<HomeScreen> {
           shrinkWrap: true,
           children: [
             ListTile(title: Text(name)),
-            if (uri.isNotEmpty) ...[
+            if (!received || uri.isNotEmpty) ...[
               ListTile(
                 leading: const Icon(Icons.open_in_new),
                 title: const Text('Открыть файл'),
@@ -360,12 +361,13 @@ class _HomeScreenState extends State<HomeScreen> {
                 title: const Text('Открыть расположение файла'),
                 onTap: () => Navigator.pop(context, 'location'),
               ),
+            ],
+            if (uri.isNotEmpty)
               ListTile(
                 leading: const Icon(Icons.delete_outline),
                 title: const Text('Удалить файл'),
                 onTap: () => Navigator.pop(context, 'delete'),
               ),
-            ],
             ListTile(
               leading: const Icon(Icons.info_outline),
               title: const Text('Информация о файле'),
@@ -384,7 +386,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final options = {'id': id};
     switch (action) {
       case 'open':
-        await _run('open', {'uri': uri, 'name': name});
+        await _run('openHistoryFile', options);
       case 'location':
         await _run('historyFileLocation', options);
       case 'info':
@@ -479,7 +481,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Обмен файлами'),
+        title: const Text('WDrop'),
         actions: [
           PopupMenuButton<String>(
             tooltip: 'Настройки',

@@ -110,7 +110,7 @@ internal class AppUpdate(private val context: Context) {
         val connection = URL(url).openConnection() as HttpURLConnection
         connection.connectTimeout = 12_000
         connection.readTimeout = 30_000
-        connection.setRequestProperty("User-Agent", "LocalTransfer/$version")
+        connection.setRequestProperty("User-Agent", "WDrop/$version")
         return try {
             request(connection)
         } finally {
