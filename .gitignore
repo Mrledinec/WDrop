@@ -1,0 +1,14 @@
+/.venv/
+/.windows-build/
+/dist/
+/LocalTransfer-dev/
+/.android-scaffold/
+__pycache__/
+*.py[cod]
+desktop.ini
+/android_app/.dart_tool/
+/android_app/.flutter-plugins-dependencies
+/android_app/build/
+/android_app/android/.kotlin/
+/android_app/android/local.properties
+*.iml

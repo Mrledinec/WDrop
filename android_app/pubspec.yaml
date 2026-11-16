@@ -1,0 +1,21 @@
+name: airdrop_app
+description: Прямой обмен файлами между устройствами в локальной сети.
+publish_to: 'none'
+version: 0.1.2+3
+
+environment:
+  sdk: '>=3.10.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  material_ui: 1.11.0
+  mobile_scanner: ^7.5.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
