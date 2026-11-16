@@ -2,7 +2,9 @@ package local.transfer.airdrop_app
 
 import android.Manifest
 import android.app.Activity
+import android.app.DownloadManager
 import android.app.NotificationManager
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,6 +13,10 @@ import android.net.nsd.NsdManager
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import android.provider.DocumentsContract
+import android.provider.MediaStore
+import android.provider.Settings
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -29,6 +35,7 @@ internal fun transferStore(context: Context): TransferStore {
 
 class MainActivity : FlutterActivity() {
     private val store by lazy { transferStore(this) }
+    private val update by lazy { AppUpdate(applicationContext) }
     private val executor = Executors.newCachedThreadPool()
     private var picking: Pair<Peer, MethodChannel.Result>? = null
     private var sharedFiles = emptyList<Uri>()
@@ -113,6 +120,14 @@ class MainActivity : FlutterActivity() {
                     val id = call.argument<String>("id").orEmpty()
                     when (call.method) {
                         "state" -> result.success(snapshot())
+                        "updateVersion" -> result.success(update.version)
+                        "checkUpdate" -> executor.execute {
+                            val operation = runCatching { update.check() }
+                            runOnUiThread {
+                                operation.fold(result::success) { error -> fail(result, error) }
+                            }
+                        }
+                        "installUpdate" -> installUpdate(result)
                         "discover" -> {
                             startDiscovery()
                             result.success(null)
@@ -218,6 +233,26 @@ class MainActivity : FlutterActivity() {
                             sharedFiles = emptyList()
                             result.success(null)
                         }
+                        "clearHistory" -> {
+                            store.forgetHistory()
+                            result.success(null)
+                        }
+                        "forgetFile" -> {
+                            require(id.isNotEmpty())
+                            store.forgetHistory(id)
+                            result.success(null)
+                        }
+                        "deleteReceivedFile" -> {
+                            val uri = receivedUri(receivedHistory(id))
+                            require(contentResolver.delete(uri, null, null) > 0) { "Файл уже перемещён или удалён." }
+                            store.forgetHistory(id)
+                            result.success(null)
+                        }
+                        "receivedFileInfo" -> result.success(receivedFileInfo(id))
+                        "receivedFileLocation" -> {
+                            openReceivedFolder(id)
+                            result.success(null)
+                        }
                         "open" -> {
                             val uri = Uri.parse(call.argument<String>("uri").orEmpty())
                             require(uri.scheme == "content")
@@ -242,7 +277,75 @@ class MainActivity : FlutterActivity() {
             }
     }
 
-    private fun snapshot(): Map<String, Any> {
+    private fun receivedHistory(id: String): Map<String, Any> =
+        requireNotNull(store.history().find { it["id"] == id && it["direction"] == "received" }) {
+            "Запись о файле недоступна."
+        }
+
+    private fun receivedUri(item: Map<String, Any>): Uri =
+        Uri.parse(item["uri"] as? String ?: "").also { uri ->
+            require(uri.scheme == "content" && uri.authority == "media") { "Файл недоступен в загрузках." }
+        }
+
+    private fun receivedFileInfo(id: String): Map<String, Any> {
+        val item = receivedHistory(id)
+        val uri = receivedUri(item)
+        val fields = arrayOf(
+            MediaStore.Downloads.DISPLAY_NAME, MediaStore.Downloads.SIZE,
+            MediaStore.Downloads.MIME_TYPE, MediaStore.Downloads.RELATIVE_PATH,
+        )
+        val info = item.toMutableMap()
+        val available = contentResolver.query(uri, fields, null, null, null)?.use { cursor ->
+            if (!cursor.moveToFirst()) {
+                false
+            } else {
+                cursor.getString(0)?.let { info["name"] = it }
+                if (!cursor.isNull(1)) info["size"] = cursor.getLong(1)
+                cursor.getString(2)?.let { info["type"] = it }
+                cursor.getString(3)?.let { info["folder"] = it.trimEnd('/') }
+                true
+            }
+        } ?: false
+        info["available"] = available
+        return info
+    }
+
+    private fun openReceivedFolder(id: String) {
+        val path = receivedFileInfo(id)["folder"] as? String ?: "Download/Local Transfer"
+        val folder = DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:$path")
+        try {
+            startActivity(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, folder)
+            })
+        } catch (_: ActivityNotFoundException) {
+            startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
+        }
+    }
+
+    private fun installUpdate(result: MethodChannel.Result) {
+        if (!packageManager.canRequestPackageInstalls()) {
+            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+            result.success(false)
+            return
+        }
+        executor.execute {
+            val operation = runCatching { update.download() }
+            runOnUiThread {
+                runCatching {
+                    val uri = FileProvider.getUriForFile(this, "$packageName.updates", operation.getOrThrow())
+                    startActivity(Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, "application/vnd.android.package-archive")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    })
+                    true
+                }.fold(result::success) { error -> fail(result, error) }
+            }
+        }
+    }
+
+    private fun snapshot(): Map<String, Any?> {
         val online = reachable
         val peers = store.peers()
         return mapOf(
@@ -261,7 +364,9 @@ class MainActivity : FlutterActivity() {
             "sending" to FileTransfer.sending,
             "sharedCount" to sharedFiles.size,
             "sendStatus" to FileTransfer.sendStatus,
+            "sendProgress" to FileTransfer.sendProgress,
             "receiveStatus" to ReceiveService.receiveMessage,
+            "receiveProgress" to ReceiveService.receiveProgress,
         )
     }
 

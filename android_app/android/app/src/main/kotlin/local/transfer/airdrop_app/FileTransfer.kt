@@ -20,6 +20,8 @@ internal object FileTransfer {
         private set
     @Volatile var sendStatus = ""
         private set
+    @Volatile var sendProgress: Int? = null
+        private set
 
     @Synchronized
     fun beginSend(): Boolean {
@@ -42,11 +44,13 @@ internal object FileTransfer {
             sendStatus = if (files.size == 1) "Ошибка отправки: $detail"
                 else "Отправлено $completed из " + files.size + ". Ошибка: $detail"
         } finally {
+            sendProgress = null
             sending = false
         }
     }
 
     private fun sendFile(context: Context, store: TransferStore, peer: Peer, uri: Uri) {
+        sendProgress = null
         sendStatus = "Подготовка файла…"
         val resolver = context.contentResolver
         val name = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
@@ -79,6 +83,8 @@ internal object FileTransfer {
             "expired", "pending" -> throw IOException("Время ожидания подтверждения истекло")
             else -> throw IOException("ПК не может принять файл")
         }
+        sendStatus = "Отправка: $name"
+        sendProgress = progress(0, size)
         api.request("/offers/$id/content", "PUT", timeout = 20_000) { connection ->
             connection.doOutput = true
             connection.setRequestProperty("Content-Type", "application/octet-stream")
@@ -92,13 +98,14 @@ internal object FileTransfer {
                         if (count < 0) break
                         output.write(buffer, 0, count)
                         sent += count
-                        sendStatus = "Отправка · " + progress(sent, size) + " %"
+                        sendProgress = progress(sent, size)
                     }
                 }
             }
             api.check(connection)
         }
         store.record(id, name, "sent", size)
+        sendProgress = null
         sendStatus = "Отправлено: $name"
     }
 

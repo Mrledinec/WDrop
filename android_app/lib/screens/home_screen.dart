@@ -5,6 +5,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
 import '../services/network_service.dart';
+import 'update_dialog.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -63,7 +64,12 @@ class _HomeScreenState extends State<HomeScreen> {
   Iterable<Map<Object?, Object?>> _items(String key) =>
       (_state[key] as List? ?? []).cast<Map<Object?, Object?>>();
 
-  Future<String?> _input(String title, String label, String initial) async {
+  Future<String?> _input(
+    String title,
+    String label,
+    String initial, {
+    bool numeric = false,
+  }) async {
     var value = initial;
     final answer = await showDialog<String>(
       context: context,
@@ -72,6 +78,7 @@ class _HomeScreenState extends State<HomeScreen> {
         content: TextFormField(
           initialValue: initial,
           autofocus: true,
+          keyboardType: numeric ? TextInputType.number : TextInputType.text,
           decoration: InputDecoration(labelText: label),
           onChanged: (text) => value = text,
           onFieldSubmitted: (text) => Navigator.pop(context, text),
@@ -135,8 +142,9 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _pairFound(Map<Object?, Object?> device) async {
     final code = await _input(
       'Подключение к ПК',
-      'Код из окна сопряжения на ПК',
+      'Шесть цифр из окна на ПК',
       '',
+      numeric: true,
     );
     if (!mounted || code == null || code.isEmpty || _pairing) return;
     setState(() => _pairing = true);
@@ -148,8 +156,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final clipboard = await Clipboard.getData(Clipboard.kTextPlain);
     if (!mounted) return;
     final code = await _input(
-      'Код подключения',
-      'Вставьте код с ПК',
+      'Приглашение с ПК',
+      'Вставьте скопированное приглашение',
       clipboard?.text ?? '',
     );
     if (mounted) await _pair(code);
@@ -287,8 +295,148 @@ class _HomeScreenState extends State<HomeScreen> {
       onTap: uri.isEmpty
           ? null
           : () => _run('open', {'uri': uri, 'name': name}),
+      onLongPress: () => _historyMenu(item),
     );
   }
+
+  Future<bool> _confirm(String title, String message, String action) async {
+    return await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            scrollable: true,
+            title: Text(title),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Отмена'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: Text(action),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  Future<void> _clearHistory() async {
+    if (await _confirm(
+          'Очистить историю',
+          'Удалить все записи о передачах? Файлы останутся в загрузках.',
+          'Очистить',
+        ) &&
+        mounted) {
+      await _run('clearHistory');
+    }
+  }
+
+  Future<void> _historyMenu(Map<Object?, Object?> item) async {
+    final id = item['id'] as String;
+    final name = item['name'].toString();
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            ListTile(title: Text(name)),
+            if (item['direction'] == 'received') ...[
+              ListTile(
+                leading: const Icon(Icons.folder_open_outlined),
+                title: const Text('Открыть расположение файла'),
+                onTap: () => Navigator.pop(context, 'location'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.info_outline),
+                title: const Text('Информация о файле'),
+                onTap: () => Navigator.pop(context, 'info'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('Удалить файл'),
+                onTap: () => Navigator.pop(context, 'delete'),
+              ),
+            ],
+            ListTile(
+              leading: const Icon(Icons.remove_circle_outline),
+              title: const Text('Удалить из списка'),
+              onTap: () => Navigator.pop(context, 'forget'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    final options = {'id': id};
+    switch (action) {
+      case 'location':
+        await _run('receivedFileLocation', options);
+      case 'info':
+        await _showFileInfo(id);
+      case 'delete':
+        if (await _confirm(
+              'Удалить файл',
+              'Удалить «$name» из загрузок?',
+              'Удалить',
+            ) &&
+            mounted) {
+          await _run('deleteReceivedFile', options);
+        }
+      case 'forget':
+        await _run('forgetFile', options);
+    }
+  }
+
+  Future<void> _showFileInfo(String id) async {
+    try {
+      final info = await _platform.receivedFileInfo(id);
+      if (!mounted) return;
+      final date = DateTime.fromMillisecondsSinceEpoch(info['time'] as int);
+      final locale = MaterialLocalizations.of(context);
+      final type = info['type'] as String?;
+      final folder = info['folder'] as String? ?? 'Download/Local Transfer';
+      final details = [
+        info['name'].toString(),
+        'Размер: ${_size(info['size'])}',
+        if (type != null) 'Тип: $type',
+        'Папка: $folder',
+        'Получен: ${locale.formatMediumDate(date)} ${locale.formatTimeOfDay(TimeOfDay.fromDateTime(date))}',
+        if (info['available'] == false) 'Файл перемещён или удалён.',
+      ].join('\n');
+      await showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          scrollable: true,
+          title: const Text('Информация о файле'),
+          content: SelectableText(details),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Закрыть'),
+            ),
+          ],
+        ),
+      );
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message ?? 'Файл недоступен')),
+        );
+      }
+    }
+  }
+
+  Widget _transferProgress(String label, int percent) => ListTile(
+    title: Text(label),
+    trailing: Text('$percent %'),
+    subtitle: LinearProgressIndicator(
+      value: percent / 100,
+      semanticsLabel: label,
+      semanticsValue: '$percent %',
+    ),
+  );
 
   @override
   Widget build(BuildContext context) {
@@ -299,6 +447,9 @@ class _HomeScreenState extends State<HomeScreen> {
     final history = _items('history');
     final sendStatus = _state['sendStatus'] as String? ?? '';
     final receiveStatus = _state['receiveStatus'] as String? ?? '';
+    final sendProgress = _state['sendProgress'] as int?;
+    final receiveProgress = _state['receiveProgress'] as Map?;
+    final receivePercent = receiveProgress?['percent'] as int?;
     final sharedCount = _state['sharedCount'] as int? ?? 0;
     final canSend = peers.isNotEmpty && _state['sending'] != true;
     final networks = _items('networks');
@@ -309,10 +460,34 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('Обмен файлами'),
         actions: [
-          IconButton(
-            tooltip: 'Лимит приёма',
-            onPressed: _limit,
+          PopupMenuButton<String>(
+            tooltip: 'Настройки',
             icon: const Icon(Icons.settings_outlined),
+            onSelected: (action) {
+              switch (action) {
+                case 'limit':
+                  _limit();
+                case 'clearHistory':
+                  _clearHistory();
+                case 'update':
+                  showDialog<void>(
+                    context: context,
+                    barrierDismissible: false,
+                    builder: (_) => const UpdateDialog(),
+                  );
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'limit', child: Text('Лимит приёма')),
+              PopupMenuItem(
+                value: 'clearHistory',
+                child: Text('Очистить историю передач'),
+              ),
+              PopupMenuItem(
+                value: 'update',
+                child: Text('Проверить обновление'),
+              ),
+            ],
           ),
         ],
       ),
@@ -460,8 +635,17 @@ class _HomeScreenState extends State<HomeScreen> {
             )
           else
             ...peers.map(_device),
-          if (sendStatus.isNotEmpty) ListTile(title: Text(sendStatus)),
-          if (receiveStatus.isNotEmpty) ListTile(title: Text(receiveStatus)),
+          if (sendProgress != null)
+            _transferProgress(sendStatus, sendProgress)
+          else if (sendStatus.isNotEmpty)
+            ListTile(title: Text(sendStatus)),
+          if (receivePercent != null)
+            _transferProgress(
+              'Приём: ${receiveProgress?['name']}',
+              receivePercent,
+            )
+          else if (receiveStatus.isNotEmpty)
+            ListTile(title: Text(receiveStatus)),
           if (history.isNotEmpty) ...[
             const Divider(),
             Text('История', style: Theme.of(context).textTheme.titleMedium),

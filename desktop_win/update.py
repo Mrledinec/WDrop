@@ -10,7 +10,8 @@ from tempfile import NamedTemporaryFile
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-VERSION = "0.1.3"
+VERSION = "0.1.5"
+REPOSITORY = "Mrledinec/WDrop"
 MAX_INSTALLER_SIZE = 512 * 1024 * 1024
 
 
@@ -23,18 +24,8 @@ class Release:
     size: int
 
 
-def validate_repository(value):
-    repository = value.strip()
-    if not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+", repository):
-        raise ValueError("Введите репозиторий GitHub в формате владелец/проект.")
-    if repository.split("/")[1] in {".", ".."}:
-        raise ValueError("Введите имя проекта GitHub.")
-    return repository
-
-
-def check_release(repository):
-    repository = validate_repository(repository)
-    url = f"https://api.github.com/repos/{repository}/releases/latest"
+def check_release():
+    url = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
     request = Request(url, headers={
         "Accept": "application/vnd.github+json",
         "User-Agent": f"LocalTransfer/{VERSION}",
@@ -46,10 +37,10 @@ def check_release(repository):
         if error.code == 404:
             raise ValueError("Репозиторий недоступен или в нём ещё нет опубликованных выпусков.") from error
         raise
-    return parse_release(repository, data)
+    return parse_release(data)
 
 
-def parse_release(repository, data):
+def parse_release(data):
     tag = data.get("tag_name", "")
     match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", tag)
     if not match:
@@ -60,7 +51,7 @@ def parse_release(repository, data):
 
     version = ".".join(map(str, target))
     filename = f"LocalTransfer-Setup-{version}.exe"
-    url = f"https://github.com/{repository}/releases/download/{tag}/{filename}"
+    url = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{filename}"
     asset = next((item for item in data.get("assets", []) if item.get("name") == filename), None)
     if asset is None or asset.get("browser_download_url", "").lower() != url.lower():
         raise ValueError(f"В выпуске отсутствует установщик {filename}.")

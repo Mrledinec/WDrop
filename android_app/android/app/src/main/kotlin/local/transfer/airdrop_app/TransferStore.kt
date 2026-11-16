@@ -58,8 +58,9 @@ internal class TransferStore(context: Context) {
 
     fun pairDiscovered(device: LanDevice, code: String): Peer {
         val token = code.filterNot { it.isWhitespace() || it == '-' }.lowercase()
-        require(token.matches(Regex("[0-9a-f]{16}[0-9]{8}")) && token.startsWith(device.pin.take(16))) {
-            "Код не соответствует найденному ПК. Проверьте код в окне сопряжения на ПК."
+        val legacyCode = token.matches(Regex("[0-9a-f]{16}[0-9]{8}")) && token.startsWith(device.pin.take(16))
+        require(token.matches(Regex("[0-9]{6}")) || legacyCode) {
+            "Введите шестизначный код из окна сопряжения на ПК."
         }
         return pairAt(Peer(device.pin, device.name, device.host, device.port, ""), token)
     }
@@ -96,14 +97,40 @@ internal class TransferStore(context: Context) {
             "id" to id, "name" to name, "direction" to direction, "size" to size,
             "uri" to uri, "time" to System.currentTimeMillis(),
         )
-        val editor = prefs.edit().putString("history", JSONArray(
-            (listOf(newItem) + history).take(20).map { JSONObject(it) },
-        ).toString())
+        val items = listOf(newItem) + history
+        val editor = historyEditor(items.take(20), items)
         if (receipt != null) {
             val receipts = JSONObject(prefs.getString("receipts", "{}")).put(id, receipt)
             editor.putString("receipts", receipts.toString())
         }
         editor.commit()
+    }
+
+    @Synchronized
+    fun forgetHistory(id: String? = null) {
+        val entries = history()
+        val kept = if (id == null) emptyList() else entries.filterNot { it["id"] == id }
+        historyEditor(kept, entries).apply()
+    }
+
+    @Synchronized
+    fun receivedIds(): Set<String> = recentReceives(history()).keys().asSequence().toSet()
+
+    private fun historyEditor(kept: List<Map<String, Any>>, entries: List<Map<String, Any>>) =
+        prefs.edit()
+            .putString("history", JSONArray(kept.map { JSONObject(it) }).toString())
+            .putString("recent_receives", recentReceives(entries).toString())
+
+    private fun recentReceives(entries: List<Map<String, Any>>): JSONObject {
+        // Preserve delivery deduplication when the user removes visible history.
+        val cutoff = System.currentTimeMillis() - 60 * 60 * 1000L
+        val recent = JSONObject(prefs.getString("recent_receives", "{}"))
+        recent.keys().asSequence().filter { recent.optLong(it) < cutoff }.toList().forEach { recent.remove(it) }
+        for (item in entries) {
+            val time = (item["time"] as? Number)?.toLong() ?: continue
+            if (item["direction"] == "received" && time >= cutoff) recent.put(item["id"] as String, time)
+        }
+        return recent
     }
 
     @Synchronized

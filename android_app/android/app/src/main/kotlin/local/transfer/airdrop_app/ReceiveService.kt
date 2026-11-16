@@ -105,7 +105,7 @@ class ReceiveService : Service() {
         val now = SystemClock.elapsedRealtime()
         pending.values.filter { it.expires <= now }.forEach { removePrompt(it.offer.id) }
         val peers = store.peers()
-        val completed = store.history().map { it["id"] }.toSet()
+        val completed = store.receivedIds()
         reachable.keys.retainAll(peers.map { it.pin }.toSet())
         for (peer in peers) {
             val api = api(peer)
@@ -147,7 +147,7 @@ class ReceiveService : Service() {
         try {
             downloads.execute {
                 val currentPeer = store.peers().find { it.pin == item.peer.pin }
-                if (currentPeer == null || store.history().any { it["id"] == id }) {
+                if (currentPeer == null || id in store.receivedIds() || id in store.receipts(currentPeer)) {
                     active.remove(id)
                     return@execute
                 }
@@ -159,6 +159,7 @@ class ReceiveService : Service() {
                         accepted = decision.state == "accepted"
                     }
                     if (accepted) {
+                        receiveMessage = ""
                         notifyProgress(item, 0)
                         val wake = getSystemService(PowerManager::class.java)
                             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocalTransfer:receive")
@@ -177,6 +178,7 @@ class ReceiveService : Service() {
                     receiveMessage = "Ошибка приёма: $message"
                     if (accept) notifyResult(item, message)
                 } finally {
+                    receiveProgress = emptyMap()
                     active.remove(id)
                 }
             }
@@ -234,6 +236,7 @@ class ReceiveService : Service() {
     }
 
     private fun notifyProgress(item: Incoming, progress: Int) {
+        receiveProgress = mapOf("name" to item.offer.name, "percent" to progress)
         val notification = Notification.Builder(this, SERVICE_CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle("Приём файла")
@@ -276,6 +279,8 @@ class ReceiveService : Service() {
         @Volatile var online: Set<String> = emptySet()
             private set
         @Volatile var receiveMessage = ""
+            private set
+        @Volatile var receiveProgress: Map<String, Any> = emptyMap()
             private set
         internal val pending = ConcurrentHashMap<String, Incoming>()
         private val active = ConcurrentHashMap.newKeySet<String>()

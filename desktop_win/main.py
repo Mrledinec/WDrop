@@ -6,19 +6,25 @@ import json
 import logging
 import os
 import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
+from tempfile import TemporaryFile
 
 import qrcode
 import ifaddr
 import uvicorn
-from PyQt6.QtCore import QEvent, QSettings, QSignalBlocker, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices, QImage, QPixmap
+from PyQt6.QtCore import (
+    QEvent, QFile, QLocale, QSettings, QSignalBlocker, QStandardPaths, Qt, QTimer,
+    pyqtSignal,
+)
+from PyQt6.QtGui import QColor, QImage, QPixmap
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
-    QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton,
     QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
@@ -27,7 +33,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from desktop_win.server.server_api import TransferService, local_ipv4, make_api
-from desktop_win.update import VERSION, check_release, download_installer, validate_repository
+from desktop_win.update import VERSION, check_release, download_installer
 
 
 STATE_LABELS = {
@@ -39,6 +45,10 @@ STATE_LABELS = {
     "expired": "Время ожидания истекло",
     "failed": "Ошибка",
 }
+
+
+def file_size(size):
+    return QLocale.system().formattedDataSize(size, 2, QLocale.DataSizeFormat.DataSizeTraditionalFormat)
 
 
 class Window(QMainWindow):
@@ -68,14 +78,17 @@ class Window(QMainWindow):
         self.update_dir = Path(service.db_path).parent
         self.settings = QSettings(str(self.update_dir / "desktop.ini"), QSettings.Format.IniFormat)
         self.update_busy = False
+        self.update_dialog = None
+        self.release = None
         self.exiting = False
         self.tray = None
 
         self.setWindowTitle("Обмен файлами")
-        help_menu = self.menuBar().addMenu("Справка")
-        help_menu.addAction("Проверить обновления", self.check_updates)
-        help_menu.addAction("Источник обновлений", self.set_update_repository)
-        help_menu.addAction(f"Версия {VERSION}").setEnabled(False)
+        settings_menu = self.menuBar().addMenu("Настройки")
+        settings_menu.addAction("Папка для полученных файлов…", self.choose_inbox)
+        settings_menu.addAction("Очистить историю передач…", self.clear_history)
+        settings_menu.addSeparator()
+        settings_menu.addAction("Проверить обновление", self.open_updates)
         self.resize(900, 740)
         self.setAcceptDrops(True)
         self.setWindowIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveNetIcon))
@@ -128,7 +141,7 @@ class Window(QMainWindow):
         )
         layout.addWidget(self.drop_area)
         layout.addWidget(self.section_label("Передачи"))
-        self.transfers = self.table(("Файл", "Направление", "Устройство", "Состояние"))
+        self.transfers = self.table(("Файл", "Направление", "Устройство", "Состояние", "Прогресс"))
         layout.addWidget(self.transfers)
         row = QHBoxLayout()
         row.addWidget(self.button("Принять", lambda: self.decide(True)))
@@ -138,6 +151,9 @@ class Window(QMainWindow):
         layout.addWidget(self.section_label("История"))
         self.history = self.table(("Файл", "Направление", "Размер"))
         self.history.setMaximumHeight(150)
+        self.history.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.history.customContextMenuRequested.connect(self.history_menu)
+        self.history.cellDoubleClicked.connect(self.open_history_file)
         layout.addWidget(self.history)
         self.show_status(f"Папка приёма: {service.inbox}")
 
@@ -207,33 +223,141 @@ class Window(QMainWindow):
     def show_status(self, message):
         self.statusBar().showMessage(message)
 
-    def set_update_repository(self):
-        current = self.settings.value("updates/repository", "", str)
-        value, ok = QInputDialog.getText(
-            self, "Источник обновлений", "Публичный репозиторий GitHub в формате владелец/проект",
-            text=current,
-        )
-        if not ok:
-            return current
+    def choose_inbox(self):
+        directory = QFileDialog.getExistingDirectory(self, "Папка для полученных файлов", str(self.service.inbox))
+        if not directory:
+            return
+        path = Path(directory)
         try:
-            repository = validate_repository(value) if value.strip() else ""
-        except ValueError as error:
-            QMessageBox.warning(self, "Обновления", str(error))
-            return current
-        self.settings.setValue("updates/repository", repository)
-        return repository
+            with TemporaryFile(dir=path):
+                pass
+        except OSError as error:
+            QMessageBox.warning(self, "Папка приёма", f"Не удалось записать файл в эту папку.\n{error}")
+            return
+        with self.service.lock:
+            self.service.inbox = path
+        self.settings.setValue("transfer/inbox", str(path))
+        self.show_status(f"Папка приёма: {path}")
+
+    def confirm(self, title, message):
+        return QMessageBox.question(
+            self, title, message, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+
+    def clear_history(self):
+        if self.confirm("Очистить историю", "Удалить все записи о передачах? Файлы останутся на диске."):
+            self.edit_history(self.service.history.clear_transfer_history)
+
+    def edit_history(self, operation):
+        try:
+            operation()
+        except Exception as error:
+            QMessageBox.warning(self, "История передач", str(error))
+        self.refresh()
+
+    def history_item(self, row):
+        cell = self.history.item(row, 0)
+        if cell is None:
+            return None
+        record_id = cell.data(Qt.ItemDataRole.UserRole)
+        return next((item for item in self.last_history if item.id == record_id), None)
+
+    def open_history_file(self, row, _column):
+        if item := self.history_item(row):
+            self.open_file(Path(item.file_path))
+
+    def open_file(self, path, reveal=False):
+        try:
+            if not path.is_file():
+                raise FileNotFoundError("Файл перемещён или удалён.")
+            if reveal:
+                subprocess.Popen(["explorer.exe", "/select,", str(path)])
+            else:
+                os.startfile(str(path))
+        except OSError as error:
+            QMessageBox.warning(self, "Открыть файл", str(error))
+
+    def history_menu(self, position):
+        row = self.history.indexAt(position).row()
+        item = self.history_item(row)
+        if item is None:
+            return
+        self.history.selectRow(row)
+        path = Path(item.file_path)
+        menu = QMenu(self.history)
+        open_file = menu.addAction("Открыть файл")
+        reveal = menu.addAction("Открыть расположение файла")
+        delete_file = None
+        if item.source_device_id != self.service.pin:
+            delete_file = menu.addAction("Удалить файл в корзину…")
+            delete_file.setEnabled(path.is_file())
+        menu.addSeparator()
+        remove = menu.addAction("Удалить из списка")
+        action = menu.exec(self.history.viewport().mapToGlobal(position))
+        if action is None:
+            return
+        if action == open_file or action == reveal:
+            self.open_file(path, reveal=action == reveal)
+        elif action == delete_file:
+            if self.confirm("Удалить файл", f"Переместить «{path.name}» в корзину?"):
+                target = QFile(str(path))
+                if not target.moveToTrash():
+                    QMessageBox.warning(self, "Удаление файла", target.errorString())
+                    return
+                self.edit_history(lambda: self.service.history.delete_transfer_record(item.id))
+        elif action == remove:
+            self.edit_history(lambda: self.service.history.delete_transfer_record(item.id))
+
+    def open_updates(self):
+        if self.update_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Обновления")
+            dialog.setMinimumSize(400, 200)
+            dialog.resize(560, 260)
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(QLabel(f"Текущая версия: {VERSION}"))
+            self.update_status = QPlainTextEdit()
+            self.update_status.setReadOnly(True)
+            layout.addWidget(self.update_status)
+            actions = QHBoxLayout()
+            self.check_update_button = self.button("Проверить обновление", self.check_updates)
+            self.install_update_button = self.button("Установить", self.install_update)
+            self.install_update_button.hide()
+            actions.addWidget(self.check_update_button)
+            actions.addWidget(self.install_update_button)
+            actions.addStretch()
+            layout.addLayout(actions)
+            self.update_dialog = dialog
+        self.update_dialog.show()
+        self.update_dialog.raise_()
+        self.update_dialog.activateWindow()
+        self.check_updates()
 
     def check_updates(self):
         if self.update_busy:
             return
-        repository = self.settings.value("updates/repository", "", str) or self.set_update_repository()
-        if not repository:
+        self.release = None
+        self.start_update_task(check_release, self.update_checked, "Проверяем обновления…")
+
+    def install_update(self):
+        if self.update_busy or self.release is None:
             return
-        self.start_update_task(lambda: check_release(repository), self.update_checked, "Проверяем обновления…")
+        release = self.release
+        self.start_update_task(
+            lambda: download_installer(release, self.update_dir / "updates"),
+            self.installer_downloaded, "Скачиваем установщик…",
+        )
+
+    def set_update_state(self, status, busy=False):
+        self.update_busy = busy
+        self.update_status.setPlainText(status)
+        self.check_update_button.setEnabled(not busy)
+        self.install_update_button.setVisible(self.release is not None)
+        self.install_update_button.setEnabled(not busy)
 
     def start_update_task(self, operation, signal, status):
-        self.update_busy = True
-        self.show_status(status)
+        self.set_update_state(status, busy=True)
 
         def run():
             try:
@@ -244,31 +368,30 @@ class Window(QMainWindow):
         threading.Thread(target=run, daemon=True, name="Windows update").start()
 
     def show_update_result(self, release, error):
-        self.update_busy = False
-        self.statusBar().clearMessage()
+        self.release = release
         if error:
-            QMessageBox.warning(self, "Обновления", error)
+            self.set_update_state(error)
         elif release is None:
-            QMessageBox.information(self, "Обновления", f"Установлена актуальная версия {VERSION}.")
-        elif QMessageBox.question(
-            self, "Доступно обновление", f"Скачать установщик версии {release.version}?",
-        ) == QMessageBox.StandardButton.Yes:
-            self.start_update_task(
-                lambda: download_installer(release, self.update_dir / "updates"),
-                self.installer_downloaded, "Скачиваем установщик…",
-            )
+            self.set_update_state("Установлена актуальная версия.")
+        else:
+            self.set_update_state(f"Доступна версия {release.version}.")
 
     def show_installer(self, path, error):
-        self.update_busy = False
-        self.statusBar().clearMessage()
         if error:
-            QMessageBox.warning(self, "Обновления", error)
+            self.set_update_state(error)
             return
-        QMessageBox.information(
-            self, "Установщик скачан",
-            f"{path.name}\n\nВыберите «Выход» в меню трея и запустите установщик из открывшейся папки.",
-        )
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+        self.set_update_state("Установщик скачан и проверен.")
+        if QMessageBox.question(
+            self.update_dialog, "Запустить установщик",
+            "Приложение закроется, текущие передачи прервутся. Продолжить установку?",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            os.startfile(str(path))
+        except OSError as error:
+            self.set_update_state(f"Не удалось открыть установщик. {error}")
+        else:
+            self.quit_from_tray()
 
     def refresh(self):
         with self.service.lock:
@@ -282,7 +405,8 @@ class Window(QMainWindow):
             ]
             offers = [
                 (offer.id, offer.metadata.name, "На ПК" if offer.direction == "upload" else "На телефон",
-                 names.get(offer.peer_id, "Удалённое устройство"), self.state_label(offer))
+                 names.get(offer.peer_id, "Удалённое устройство"), self.state_label(offer),
+                 self.transfer_progress(offer))
                 for offer in reversed(list(self.service.offers.values()))
             ]
         if pending is not None:
@@ -300,14 +424,25 @@ class Window(QMainWindow):
             self.set_rows(self.devices, peer_rows, checkbox_column=1)
         if offers != self.last_offers:
             self.last_offers = offers
-            self.set_rows(self.transfers, offers)
+            self.set_rows(self.transfers, [(*row[:-1], "") for row in offers])
+            for index, (*_, progress) in enumerate(offers):
+                if progress is None:
+                    self.transfers.removeCellWidget(index, 4)
+                    continue
+                percent, transferred, total = progress
+                bar = QProgressBar()
+                bar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                bar.setValue(percent)
+                bar.setFormat("%p%")
+                bar.setToolTip(f"{file_size(transferred)} / {file_size(total)}")
+                self.transfers.setCellWidget(index, 4, bar)
 
         history = self.service.history.get_transfer_history()
         if history != self.last_history:
             self.last_history = history
             self.set_rows(self.history, [
                 (item.id, item.filename, "На телефон" if item.source_device_id == self.service.pin else "На ПК",
-                 f"{item.file_size:,} Б")
+                 file_size(item.file_size))
                 for item in history
             ])
 
@@ -316,9 +451,15 @@ class Window(QMainWindow):
         label = STATE_LABELS[offer.state]
         if offer.state == "pending":
             return f"{label} · {offer.payload()['seconds_left']} с"
-        if offer.state == "transferring" and offer.direction == "upload" and offer.metadata.size:
-            return f"{label} · {min(100, offer.received * 100 // offer.metadata.size)} %"
         return label
+
+    @staticmethod
+    def transfer_progress(offer):
+        if offer.state != "transferring":
+            return None
+        size = offer.metadata.size
+        received = min(size, offer.received)
+        return (received * 100 // size if size else 100, received, size)
 
     def refresh_network(self):
         interfaces = sorted(
@@ -415,9 +556,8 @@ class Window(QMainWindow):
         panel.setWindowTitle("Подключить телефон")
         box = QVBoxLayout(panel)
         box.addWidget(QLabel("Отсканируйте QR в приложении на телефоне. Код действует 2 минуты."))
-        manual = self.service.manual_invite.upper()
-        formatted = "-".join(manual[index:index + 4] for index in range(0, len(manual), 4))
-        manual_label = QLabel(f"Код для поиска в сети: {formatted}")
+        manual = self.service.manual_invite
+        manual_label = QLabel(f"Код для поиска в сети: {manual}")
         manual_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         box.addWidget(manual_label)
         qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=4)
@@ -436,7 +576,7 @@ class Window(QMainWindow):
         preview.setPixmap(QPixmap.fromImage(image).scaled(qr_size, qr_size))
         preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         box.addWidget(preview)
-        box.addWidget(self.button("Скопировать код", lambda: QApplication.clipboard().setText(code)))
+        box.addWidget(self.button("Скопировать приглашение", lambda: QApplication.clipboard().setText(code)))
         panel.show()
         self.invite_panel = panel
 
@@ -615,7 +755,13 @@ def run_app(args, windowed):
                 return 0
             raise RuntimeError(f"Не удалось открыть порт {args.port}: {error}") from error
 
-        service = TransferService(args.data_dir, args.inbox, listener.getsockname()[1])
+        settings = QSettings(str(args.data_dir / "desktop.ini"), QSettings.Format.IniFormat)
+        saved_inbox = settings.value("transfer/inbox", "", str)
+        default_inbox = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+                             or Path.home() / "Downloads") / "Local Transfer"
+        saved_path = Path(saved_inbox) if saved_inbox else None
+        inbox = args.inbox or (saved_path if saved_path and saved_path.is_dir() else default_inbox)
+        service = TransferService(args.data_dir, inbox.resolve(), listener.getsockname()[1])
         if windowed:
             logging.basicConfig(
                 filename=args.data_dir / "windows.log", encoding="utf-8",
@@ -628,6 +774,8 @@ def run_app(args, windowed):
         ))
         address = args.address or local_ipv4()
         window = Window(service, server, address, bind=args.bind, fixed_address=bool(args.address))
+        if args.inbox is None and saved_path and not saved_path.is_dir():
+            window.show_status(f"Выбранная папка недоступна. Папка приёма: {service.inbox}")
         instance = QLocalServer()
         instance.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
 
@@ -659,7 +807,7 @@ def main():
     parser.add_argument("--bind", default="0.0.0.0", help="IPv4-интерфейс для локального сервера")
     parser.add_argument("--address", help="IPv4-адрес ПК, который будет указан в QR")
     parser.add_argument("--data-dir", type=Path, default=Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LocalTransfer")
-    parser.add_argument("--inbox", type=Path, default=Path.home() / "Downloads" / "Local Transfer")
+    parser.add_argument("--inbox", type=Path)
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
     windowed = sys.stdout is None or sys.stderr is None

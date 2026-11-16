@@ -1,7 +1,7 @@
 name: airdrop_app
 description: Прямой обмен файлами между устройствами в локальной сети.
 publish_to: 'none'
-version: 0.1.2+3
+version: 0.1.5+5
 
 environment:
   sdk: '>=3.10.0 <4.0.0'

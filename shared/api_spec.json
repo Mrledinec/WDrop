@@ -439,7 +439,7 @@
           "token": {
             "type": "string",
             "maxLength": 100,
-            "minLength": 20,
+            "minLength": 6,
             "title": "Token"
           },
           "name": {

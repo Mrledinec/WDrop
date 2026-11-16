@@ -83,7 +83,7 @@ def secret_hash(token):
 
 
 class PairRequest(BaseModel):
-    token: str = Field(min_length=20, max_length=100)
+    token: str = Field(min_length=6, max_length=100)
     name: str = Field(min_length=1, max_length=80)
 
 
@@ -144,6 +144,29 @@ class Offer:
             "received": self.received,
             "seconds_left": max(0, int(OFFER_TIMEOUT - (time.monotonic() - self.created) + 0.999)),
         }
+
+
+class TrackedFileResponse(FileResponse):
+    def __init__(self, path, on_progress):
+        super().__init__(path, media_type="application/octet-stream")
+        self.on_progress = on_progress
+
+    async def __call__(self, scope, receive, send):
+        sent = 0
+        full_response = False
+
+        async def track(message):
+            nonlocal sent, full_response
+            await send(message)
+            if message["type"] == "http.response.start":
+                full_response = message["status"] == 200
+            elif full_response and message["type"] == "http.response.body":
+                sent += len(message.get("body", b""))
+                self.on_progress(sent)
+            elif full_response and message["type"] == "http.response.pathsend":
+                self.on_progress(self.path.stat().st_size)
+
+        await super().__call__(scope, receive, track)
 
 
 class TransferService:
@@ -217,7 +240,7 @@ class TransferService:
                 self.pairing.declined = True
             self.pairing = None
             self.invite_token = secrets.token_urlsafe(24)
-            self.manual_invite = f"{self.pin[:16]}{secrets.randbelow(10**8):08d}"
+            self.manual_invite = f"{secrets.randbelow(10**6):06d}"
             self.manual_attempts = 5
             self.invite_expires = time.monotonic() + 120
             return {
@@ -236,14 +259,14 @@ class TransferService:
         with self.lock:
             qr_matches = self.invite_token and hmac.compare_digest(self.invite_token.encode(), data.token.encode())
             manual_matches = False
-            if len(data.token) == 24 and self.manual_attempts and self.manual_invite and self.pairing_available():
+            if len(data.token) == 6 and self.manual_attempts and self.manual_invite and self.pairing_available():
                 self.manual_attempts -= 1
                 manual_matches = hmac.compare_digest(self.manual_invite.encode(), data.token.encode())
             if (
                 not self.pairing_available()
                 or not (qr_matches or manual_matches)
             ):
-                raise HTTPException(403, "Код сопряжения истёк или уже использован")
+                raise HTTPException(403, "Код неверный, истёк или уже использован. При необходимости создайте новый код.")
             self.invite_token = None
             self.manual_invite = None
             request = Pairing(data.name.strip() or "Android")
@@ -284,8 +307,18 @@ class TransferService:
     def check_capacity(self, size):
         if self.limit is not None and size > self.limit:
             raise HTTPException(413, "Получатель ограничил размер файла")
-        if size > shutil.disk_usage(self.inbox).free:
+        try:
+            free = shutil.disk_usage(self.inbox).free
+        except OSError as error:
+            raise HTTPException(507, "Выбранная папка приёма на компьютере недоступна") from error
+        if size > free:
             raise HTTPException(507, "На компьютере не хватает места")
+
+    def record_progress(self, offer, size):
+        with self.lock:
+            if offer.state == "transferring":
+                offer.received = max(offer.received, size)
+                offer.updated = time.monotonic()
 
     def set_state(self, offer, state):
         offer.state = state
@@ -366,10 +399,11 @@ class TransferService:
         with self.lock:
             if offer.state != "transferring":
                 raise HTTPException(409, "Передача закрыта")
-            target = self.inbox / name
+            directory = temporary.parent
+            target = directory / name
             index = 1
             while target.exists():
-                target = self.inbox / f"{name.stem} ({index}){name.suffix}"
+                target = directory / f"{name.stem} ({index}){name.suffix}"
                 index += 1
             temporary.rename(target)
             try:
@@ -447,8 +481,7 @@ def make_api(service):
             if content_length is not None and content_length != str(offer.metadata.size):
                 raise HTTPException(422, "Объявленный размер не совпадает")
             service.set_state(offer, "transferring")
-
-        temporary = service.inbox / f".{offer.id}.part"
+            temporary = service.inbox / f".{offer.id}.part"
         committed = False
         digest = hashlib.sha256()
         total = 0
@@ -461,9 +494,7 @@ def make_api(service):
                     if chunk:
                         await asyncio.to_thread(output.write, chunk)
                         digest.update(chunk)
-                        with service.lock:
-                            offer.received = total
-                            offer.updated = time.monotonic()
+                        service.record_progress(offer, total)
             if total != offer.metadata.size or digest.hexdigest() != offer.metadata.sha256:
                 raise HTTPException(422, "Проверка целостности не пройдена")
             service.publish_upload(temporary, offer)
@@ -494,7 +525,7 @@ def make_api(service):
                 service.set_state(offer, "failed")
                 raise HTTPException(410, "Исходный файл изменился или удалён")
             service.set_state(offer, "transferring")
-            return FileResponse(offer.path, media_type="application/octet-stream")
+            return TrackedFileResponse(offer.path, lambda size: service.record_progress(offer, size))
 
     @app.post(API + "/offers/{offer_id}/complete", response_model=TransferStatus)
     def complete(offer_id: str, data: Receipt, identity=Depends(peer)):

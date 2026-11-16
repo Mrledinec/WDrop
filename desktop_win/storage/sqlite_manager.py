@@ -6,6 +6,7 @@ Handles local storage for saved connections and transfer history.
 
 import sqlite3
 import os
+import contextlib
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, asdict
@@ -276,6 +277,14 @@ class SQLiteManager:
         finally:
             conn.close()
     
+    def delete_transfer_record(self, record_id: int) -> None:
+        with contextlib.closing(self._get_connection()) as conn, conn:
+            conn.execute("DELETE FROM transfer_history WHERE id = ?", (record_id,))
+
+    def clear_transfer_history(self) -> None:
+        with contextlib.closing(self._get_connection()) as conn, conn:
+            conn.execute("DELETE FROM transfer_history")
+
     def get_recent_connections_count(self) -> int:
         """Get count of recent connections (last 7 days)"""
         conn = self._get_connection()
