@@ -10,7 +10,7 @@ from tempfile import NamedTemporaryFile
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 REPOSITORY = "Mrledinec/WDrop"
 MAX_INSTALLER_SIZE = 512 * 1024 * 1024
 

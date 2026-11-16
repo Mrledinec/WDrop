@@ -15,6 +15,7 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.provider.DocumentsContract
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
@@ -39,6 +40,7 @@ class MainActivity : FlutterActivity() {
     private val executor = Executors.newCachedThreadPool()
     private var picking: Pair<Peer, MethodChannel.Result>? = null
     private var sharedFiles = emptyList<Uri>()
+    private var sharedGrantFlags = 0
     private val discoveries = ConcurrentHashMap<String, LanDevice>()
     private val probe = Executors.newSingleThreadScheduledExecutor()
     @Volatile private var reachable = emptySet<String>()
@@ -66,6 +68,7 @@ class MainActivity : FlutterActivity() {
         val clipUris = if (clip == null) emptyList() else
             (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri }
         sharedFiles = (files + clipUris).filter { it.scheme == "content" }.distinct()
+        sharedGrantFlags = persistableFlags(intent.flags)
     }
 
     override fun onPostResume() {
@@ -225,7 +228,7 @@ class MainActivity : FlutterActivity() {
                             require(sharedFiles.isNotEmpty()) { "Выберите файл через меню «Поделиться»" }
                             val peer = store.peers().find { it.pin == id }
                                 ?: throw IllegalArgumentException("ПК удалён")
-                            startSending(peer, sharedFiles)
+                            startSending(peer, sharedFiles, sharedGrantFlags)
                             sharedFiles = emptyList()
                             result.success(null)
                         }
@@ -242,15 +245,13 @@ class MainActivity : FlutterActivity() {
                             store.forgetHistory(id)
                             result.success(null)
                         }
-                        "deleteReceivedFile" -> {
-                            val uri = receivedUri(receivedHistory(id))
-                            require(contentResolver.delete(uri, null, null) > 0) { "Файл уже перемещён или удалён." }
-                            store.forgetHistory(id)
+                        "deleteHistoryFile" -> {
+                            deleteHistoryFile(id)
                             result.success(null)
                         }
-                        "receivedFileInfo" -> result.success(receivedFileInfo(id))
-                        "receivedFileLocation" -> {
-                            openReceivedFolder(id)
+                        "historyFileInfo" -> result.success(historyFileInfo(id))
+                        "historyFileLocation" -> {
+                            openHistoryFolder(id)
                             result.success(null)
                         }
                         "open" -> {
@@ -260,11 +261,11 @@ class MainActivity : FlutterActivity() {
                             val mime = mimeForName(filename) ?: contentResolver.getType(uri)
                                 ?: "application/octet-stream"
                             contentResolver.openFileDescriptor(uri, "r")?.close()
-                                ?: throw IllegalArgumentException("Файл недоступен в загрузках")
+                                ?: throw IllegalArgumentException("Файл недоступен")
                             val intent = Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime)
                                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             require(intent.resolveActivity(packageManager) != null) {
-                                "Для этого типа файла нет приложения. Файл сохранён в Download/Local Transfer."
+                                "Для этого типа файла нет приложения."
                             }
                             startActivity(Intent.createChooser(intent, "Открыть файл"))
                             result.success(null)
@@ -277,50 +278,78 @@ class MainActivity : FlutterActivity() {
             }
     }
 
-    private fun receivedHistory(id: String): Map<String, Any> =
-        requireNotNull(store.history().find { it["id"] == id && it["direction"] == "received" }) {
+    private fun historyItem(id: String): Map<String, Any> =
+        requireNotNull(store.history().find { it["id"] == id }) {
             "Запись о файле недоступна."
         }
 
-    private fun receivedUri(item: Map<String, Any>): Uri =
-        Uri.parse(item["uri"] as? String ?: "").also { uri ->
-            require(uri.scheme == "content" && uri.authority == "media") { "Файл недоступен в загрузках." }
-        }
+    private fun historyUri(item: Map<String, Any>): Uri? =
+        Uri.parse(item["uri"] as? String ?: "").takeIf { it.scheme == "content" }
 
-    private fun receivedFileInfo(id: String): Map<String, Any> {
-        val item = receivedHistory(id)
-        val uri = receivedUri(item)
-        val fields = arrayOf(
-            MediaStore.Downloads.DISPLAY_NAME, MediaStore.Downloads.SIZE,
-            MediaStore.Downloads.MIME_TYPE, MediaStore.Downloads.RELATIVE_PATH,
-        )
+    private fun historyFileInfo(id: String): Map<String, Any> {
+        val item = historyItem(id)
         val info = item.toMutableMap()
-        val available = contentResolver.query(uri, fields, null, null, null)?.use { cursor ->
-            if (!cursor.moveToFirst()) {
-                false
+        val uri = historyUri(item)
+        if (item["direction"] == "received") info["folder"] = "Download/Local Transfer"
+        val available = uri != null && runCatching {
+            val fields = if (uri.authority == "media") {
+                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE, MediaStore.MediaColumns.RELATIVE_PATH)
             } else {
-                cursor.getString(0)?.let { info["name"] = it }
-                if (!cursor.isNull(1)) info["size"] = cursor.getLong(1)
-                cursor.getString(2)?.let { info["type"] = it }
-                cursor.getString(3)?.let { info["folder"] = it.trimEnd('/') }
-                true
+                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
             }
-        } ?: false
+            contentResolver.query(uri, fields, null, null, null)?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use false
+                val name = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val size = cursor.getColumnIndex(OpenableColumns.SIZE)
+                val folder = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                if (name >= 0) cursor.getString(name)?.let { info["name"] = it }
+                if (size >= 0 && !cursor.isNull(size)) info["size"] = cursor.getLong(size)
+                if (folder >= 0) cursor.getString(folder)?.let { info["folder"] = it.trimEnd('/') }
+                true
+            } ?: false
+        }.getOrDefault(false)
+        if (uri != null) runCatching { contentResolver.getType(uri) }.getOrNull()?.let { info["type"] = it }
         info["available"] = available
         return info
     }
 
-    private fun openReceivedFolder(id: String) {
-        val path = receivedFileInfo(id)["folder"] as? String ?: "Download/Local Transfer"
-        val folder = DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:$path")
+    private fun deleteHistoryFile(id: String) {
+        val uri = requireNotNull(historyUri(historyItem(id))) { "Ссылка на исходный файл не сохранилась." }
+        val deleted = try {
+            when {
+                DocumentsContract.isDocumentUri(this, uri) -> DocumentsContract.deleteDocument(contentResolver, uri)
+                uri.authority == "media" -> contentResolver.delete(uri, null, null) > 0
+                else -> throw SecurityException()
+            }
+        } catch (_: SecurityException) {
+            throw IllegalArgumentException("Источник не разрешает удалить файл из приложения. Удалите его через «Файлы».")
+        }
+        require(deleted) { "Файл недоступен или источник не поддерживает удаление." }
+        store.forgetHistory(id)
+    }
+
+    private fun openHistoryFolder(id: String) {
+        val item = historyItem(id)
+        val uri = requireNotNull(historyUri(item)) { "Ссылка на исходный файл не сохранилась." }
+        val initial = if (DocumentsContract.isDocumentUri(this, uri)) {
+            uri
+        } else {
+            val path = historyFileInfo(id)["folder"] as? String
+            requireNotNull(path) { "Источник не предоставил расположение файла." }
+            DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:$path")
+        }
         try {
             startActivity(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
                 type = "*/*"
-                putExtra(DocumentsContract.EXTRA_INITIAL_URI, folder)
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, initial)
             })
         } catch (_: ActivityNotFoundException) {
-            startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
+            if (item["direction"] == "received") {
+                startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
+            } else {
+                throw IllegalArgumentException("Системное приложение «Файлы» недоступно.")
+            }
         }
     }
 
@@ -397,17 +426,22 @@ class MainActivity : FlutterActivity() {
             return
         }
         try {
-            startSending(peer, listOf(uri))
+            startSending(peer, listOf(uri), persistableFlags(data.flags))
             result.success(true)
         } catch (error: Exception) {
             fail(result, error)
         }
     }
 
-    private fun startSending(peer: Peer, files: List<Uri>) {
+    private fun persistableFlags(flags: Int): Int =
+        if (flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION != 0) {
+            flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        } else 0
+
+    private fun startSending(peer: Peer, files: List<Uri>, grantFlags: Int) {
         require(picking == null) { "Сначала закройте выбор файла" }
         require(FileTransfer.beginSend()) { "Уже выполняется отправка" }
-        executor.execute { FileTransfer.send(applicationContext, store, peer, files) }
+        executor.execute { FileTransfer.send(applicationContext, store, peer, files, grantFlags) }
     }
 
     private fun fail(result: MethodChannel.Result, error: Throwable) {

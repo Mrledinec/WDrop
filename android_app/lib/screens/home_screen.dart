@@ -293,9 +293,14 @@ class _HomeScreenState extends State<HomeScreen> {
         '${received ? 'Получено' : 'Отправлено'} · ${_size(item['size'])}',
       ),
       onTap: uri.isEmpty
-          ? null
+          ? () => _historyMenu(item)
           : () => _run('open', {'uri': uri, 'name': name}),
       onLongPress: () => _historyMenu(item),
+      trailing: IconButton(
+        tooltip: 'Действия с файлом',
+        icon: const Icon(Icons.more_vert),
+        onPressed: () => _historyMenu(item),
+      ),
     );
   }
 
@@ -324,7 +329,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _clearHistory() async {
     if (await _confirm(
           'Очистить историю',
-          'Удалить все записи о передачах? Файлы останутся в загрузках.',
+          'Удалить все записи о передачах? Файлы останутся на своих местах.',
           'Очистить',
         ) &&
         mounted) {
@@ -335,6 +340,8 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _historyMenu(Map<Object?, Object?> item) async {
     final id = item['id'] as String;
     final name = item['name'].toString();
+    final received = item['direction'] == 'received';
+    final uri = item['uri'] as String? ?? '';
     final action = await showModalBottomSheet<String>(
       context: context,
       builder: (context) => SafeArea(
@@ -342,16 +349,16 @@ class _HomeScreenState extends State<HomeScreen> {
           shrinkWrap: true,
           children: [
             ListTile(title: Text(name)),
-            if (item['direction'] == 'received') ...[
+            if (uri.isNotEmpty) ...[
+              ListTile(
+                leading: const Icon(Icons.open_in_new),
+                title: const Text('Открыть файл'),
+                onTap: () => Navigator.pop(context, 'open'),
+              ),
               ListTile(
                 leading: const Icon(Icons.folder_open_outlined),
                 title: const Text('Открыть расположение файла'),
                 onTap: () => Navigator.pop(context, 'location'),
-              ),
-              ListTile(
-                leading: const Icon(Icons.info_outline),
-                title: const Text('Информация о файле'),
-                onTap: () => Navigator.pop(context, 'info'),
               ),
               ListTile(
                 leading: const Icon(Icons.delete_outline),
@@ -359,6 +366,11 @@ class _HomeScreenState extends State<HomeScreen> {
                 onTap: () => Navigator.pop(context, 'delete'),
               ),
             ],
+            ListTile(
+              leading: const Icon(Icons.info_outline),
+              title: const Text('Информация о файле'),
+              onTap: () => Navigator.pop(context, 'info'),
+            ),
             ListTile(
               leading: const Icon(Icons.remove_circle_outline),
               title: const Text('Удалить из списка'),
@@ -371,18 +383,22 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) return;
     final options = {'id': id};
     switch (action) {
+      case 'open':
+        await _run('open', {'uri': uri, 'name': name});
       case 'location':
-        await _run('receivedFileLocation', options);
+        await _run('historyFileLocation', options);
       case 'info':
         await _showFileInfo(id);
       case 'delete':
         if (await _confirm(
               'Удалить файл',
-              'Удалить «$name» из загрузок?',
+              received
+                  ? 'Удалить «$name» из загрузок?'
+                  : 'Удалить исходный файл «$name»? Копия на ПК сохранится.',
               'Удалить',
             ) &&
             mounted) {
-          await _run('deleteReceivedFile', options);
+          await _run('deleteHistoryFile', options);
         }
       case 'forget':
         await _run('forgetFile', options);
@@ -391,19 +407,24 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _showFileInfo(String id) async {
     try {
-      final info = await _platform.receivedFileInfo(id);
+      final info = await _platform.historyFileInfo(id);
       if (!mounted) return;
       final date = DateTime.fromMillisecondsSinceEpoch(info['time'] as int);
       final locale = MaterialLocalizations.of(context);
       final type = info['type'] as String?;
-      final folder = info['folder'] as String? ?? 'Download/Local Transfer';
+      final folder = info['folder'] as String?;
+      final received = info['direction'] == 'received';
+      final hasUri = (info['uri'] as String? ?? '').isNotEmpty;
       final details = [
         info['name'].toString(),
         'Размер: ${_size(info['size'])}',
         if (type != null) 'Тип: $type',
-        'Папка: $folder',
-        'Получен: ${locale.formatMediumDate(date)} ${locale.formatTimeOfDay(TimeOfDay.fromDateTime(date))}',
-        if (info['available'] == false) 'Файл перемещён или удалён.',
+        if (folder != null) 'Папка: $folder',
+        '${received ? 'Получен' : 'Отправлен'}: ${locale.formatMediumDate(date)} ${locale.formatTimeOfDay(TimeOfDay.fromDateTime(date))}',
+        if (!hasUri)
+          'В этой записи сохранились только сведения о передаче.'
+        else if (info['available'] == false)
+          'Файл перемещён, удалён или к нему больше нет доступа.',
       ].join('\n');
       await showDialog<void>(
         context: context,

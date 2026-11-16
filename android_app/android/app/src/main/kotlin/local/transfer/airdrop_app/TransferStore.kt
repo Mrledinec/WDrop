@@ -1,12 +1,15 @@
 package local.transfer.airdrop_app
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
 
 internal class TransferStore(context: Context) {
     private val prefs = context.getSharedPreferences("transfer", Context.MODE_PRIVATE)
+    private val resolver = context.contentResolver
     val network = LocalNetwork(context)
 
     var ready: Boolean
@@ -90,20 +93,31 @@ internal class TransferStore(context: Context) {
     }
 
     @Synchronized
-    fun record(id: String, name: String, direction: String, size: Long, uri: String = "", receipt: String? = null) {
+    fun record(
+        id: String, name: String, direction: String, size: Long, uri: String = "",
+        receipt: String? = null, grantFlags: Int = 0,
+    ) {
         val history = history()
         if (history.any { it["id"] == id }) return
+        if (grantFlags != 0 && direction == "sent") {
+            try {
+                resolver.takePersistableUriPermission(Uri.parse(uri), grantFlags)
+            } catch (_: SecurityException) {
+                // Some shares grant access only while their activity is active.
+            }
+        }
         val newItem = mapOf(
             "id" to id, "name" to name, "direction" to direction, "size" to size,
             "uri" to uri, "time" to System.currentTimeMillis(),
         )
         val items = listOf(newItem) + history
-        val editor = historyEditor(items.take(20), items)
+        val kept = items.take(20)
+        val editor = historyEditor(kept, items)
         if (receipt != null) {
             val receipts = JSONObject(prefs.getString("receipts", "{}")).put(id, receipt)
             editor.putString("receipts", receipts.toString())
         }
-        editor.commit()
+        if (editor.commit()) releaseUnusedGrants(items, kept)
     }
 
     @Synchronized
@@ -111,6 +125,20 @@ internal class TransferStore(context: Context) {
         val entries = history()
         val kept = if (id == null) emptyList() else entries.filterNot { it["id"] == id }
         historyEditor(kept, entries).apply()
+        releaseUnusedGrants(entries, kept)
+    }
+
+    private fun releaseUnusedGrants(entries: List<Map<String, Any>>, kept: List<Map<String, Any>>) {
+        val used = kept.map { it["uri"] }.toSet()
+        val removed = entries.filter { it["direction"] == "sent" && it["uri"] !in used }
+            .mapNotNull { it["uri"] as? String }.toSet()
+        if (removed.isEmpty()) return
+        for (permission in resolver.persistedUriPermissions.filter { it.uri.toString() in removed }) {
+            var flags = 0
+            if (permission.isReadPermission) flags = flags or Intent.FLAG_GRANT_READ_URI_PERMISSION
+            if (permission.isWritePermission) flags = flags or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            runCatching { resolver.releasePersistableUriPermission(permission.uri, flags) }
+        }
     }
 
     @Synchronized

@@ -31,11 +31,11 @@ internal object FileTransfer {
         return true
     }
 
-    fun send(context: Context, store: TransferStore, peer: Peer, files: List<Uri>) {
+    fun send(context: Context, store: TransferStore, peer: Peer, files: List<Uri>, grantFlags: Int) {
         var completed = 0
         try {
             for (uri in files) {
-                sendFile(context, store, peer, uri)
+                sendFile(context, store, peer, uri, grantFlags)
                 completed++
             }
             if (files.size > 1) sendStatus = "Отправлено файлов: $completed"
@@ -49,7 +49,7 @@ internal object FileTransfer {
         }
     }
 
-    private fun sendFile(context: Context, store: TransferStore, peer: Peer, uri: Uri) {
+    private fun sendFile(context: Context, store: TransferStore, peer: Peer, uri: Uri, grantFlags: Int) {
         sendProgress = null
         sendStatus = "Подготовка файла…"
         val resolver = context.contentResolver
@@ -104,7 +104,7 @@ internal object FileTransfer {
             }
             api.check(connection)
         }
-        store.record(id, name, "sent", size)
+        store.record(id, name, "sent", size, uri.toString(), grantFlags = grantFlags)
         sendProgress = null
         sendStatus = "Отправлено: $name"
     }

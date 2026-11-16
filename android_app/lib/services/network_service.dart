@@ -6,8 +6,8 @@ class TransferPlatform {
   Future<Map<String, dynamic>> state() async =>
       await _channel.invokeMapMethod<String, dynamic>('state') ?? {};
 
-  Future<Map<String, dynamic>> receivedFileInfo(String id) async =>
-      await _channel.invokeMapMethod<String, dynamic>('receivedFileInfo', {
+  Future<Map<String, dynamic>> historyFileInfo(String id) async =>
+      await _channel.invokeMapMethod<String, dynamic>('historyFileInfo', {
         'id': id,
       }) ??
       {};
